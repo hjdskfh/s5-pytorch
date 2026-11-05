@@ -4,11 +4,12 @@ import torchinfo
 from s5 import S5, S5Block
 
 dim = 512
-x = torch.rand(2, 8192, dim)
+x = torch.rand(2, 8192, dim) 
 # model = S5(32, 32)
+
 model = S5Block(dim, 512, block_count=8, bidir=False)
 
-print(torchinfo.summary(model, (2, 8192, dim), device='cpu', depth=5))
+print(torchinfo.summary(model.s5.seq, input_size=(8192, dim), device='cpu', depth=5))
 
 for i in range(5):
     y = model(x)

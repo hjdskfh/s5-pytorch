@@ -22,6 +22,8 @@ setup(
         'einops>=0.6',
         'scipy',
         'torch>=2',
+        'torchinfo',
+        'torchvision'
     ],
     extra_requires={
       "dev": ["jax"], 
