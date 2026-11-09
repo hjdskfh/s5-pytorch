@@ -221,9 +221,9 @@ class S5SSM(torch.nn.Module):
             case _:
                 raise ValueError(f'Unknown discretization {discretization}')
 
-    def initial_state(self, batch_size: Optional[int]):
+    def initial_state(self, batch_size: Optional[int]): # need function now, bc SingleLEDSSM.forward() explicitly performs a forward pass on each batch element, so we need to be able to create a state for each batch element
         batch_shape = (batch_size,) if batch_size is not None else ()
-        return torch.zeros((*batch_shape, self.C_tilde.shape[-2]))
+        return torch.zeros((*batch_shape, self.Lambda.shape[-1])) # changed to self.Lambda.shape[-1] to match the state size from self.C_tilde[-2]
 
     def get_BC_tilde(self):
         match self.bcInit:
@@ -344,6 +344,115 @@ class S5(torch.nn.Module):
             return torch.vmap(lambda s, ss, _state: self.seq(s, step_scale=ss, state=_state, return_state=return_state))(signal, step_scale, state)
 
 
+class SingleLEDSSM(torch.nn.Module):
+    """A scalar-input, scalar-output S5 recurrence for one LED.
+
+    For each input ``u_k`` the LED output is computed from the previous state:
+
+        y_k = (C A_bar) x_{k-1} + (C B_bar) u_k
+
+    The state is then advanced for the next input:
+
+        x_k = A_bar x_{k-1} + B_bar u_k
+    """
+
+    def __init__(
+        self,
+        state_width: int,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        discretization: Literal['zoh', 'bilinear'] = 'zoh',
+    ):
+        super().__init__()
+        state_width = int(state_width)
+        if state_width < 1:
+            raise ValueError("state_width must be positive")
+
+        Lambda, _, B, V, _ = make_DPLR_HiPPO(state_width)
+        Vinv = V.conj().T
+        Lambda, B, V, Vinv = map(
+            lambda value: torch.tensor(value, dtype=torch.complex64),
+            (Lambda, B, V, Vinv),
+        )
+
+        self.ssm = S5SSM(
+            Lambda,
+            V,
+            Vinv,
+            h=1,
+            p=state_width,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            discretization=discretization,
+            bcInit='dense',
+        )
+
+    def initial_state(self, batch_size: Optional[int] = None):
+        return self.ssm.initial_state(batch_size)
+
+    def forward(
+        self,
+        input_sequence: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+        step_scale: float | torch.Tensor = 1.0,
+        return_state: bool = False,
+    ):
+        if input_sequence.ndim not in (2, 3):
+            raise ValueError("input_sequence must have shape [batch, sequence] or [batch, sequence, 1]")
+        if input_sequence.ndim == 3:
+            if input_sequence.shape[-1] != 1:
+                raise ValueError("the LED model accepts exactly one input feature")
+            input_sequence = input_sequence[..., 0]
+
+        if torch.is_tensor(step_scale) and step_scale.ndim > 1:
+            raise ValueError("step_scale must be a scalar or one value per batch")
+
+        if not torch.is_tensor(step_scale):
+            step_scale = torch.full(
+                (input_sequence.shape[0],),
+                step_scale,
+                device=input_sequence.device,
+            )
+        elif step_scale.ndim == 0:
+            step_scale = step_scale.expand(input_sequence.shape[0])
+
+        if state is None:
+            state = self.initial_state(input_sequence.shape[0]).to(input_sequence.device)
+
+        B_tilde, C_tilde = self.ssm.get_BC_tilde()
+        step = step_scale[:, None] * torch.exp(self.ssm.log_step)
+        Lambda_bar, B_bar = torch.vmap(
+            lambda current_step: self.ssm.discretize(
+                self.ssm.Lambda,
+                B_tilde,
+                current_step,
+            )
+        )(step)
+
+        outputs = []
+        for u in input_sequence.transpose(0, 1):
+            complex_u = u.to(B_bar.dtype).squeeze(-1)
+            previous_state = state.to(Lambda_bar.dtype)
+            outputs.append(
+                (
+                    (C_tilde.squeeze(0) * Lambda_bar * previous_state).sum(dim=-1)
+                    + (
+                        C_tilde.squeeze(0)
+                        * (B_bar.squeeze(-1) * complex_u.unsqueeze(-1))
+                    ).sum(dim=-1)
+                ).real
+            )
+            state = (
+                Lambda_bar * previous_state
+                + B_bar.squeeze(-1) * complex_u.unsqueeze(-1)
+            )
+
+        output = torch.stack(outputs, dim=1)
+        if return_state:
+            return output, state
+        return output
+
+
 class GEGLU(torch.nn.Module):
     def forward(self, x):
         x, gates = x.chunk(2, dim=-1)
@@ -443,4 +552,3 @@ if __name__ == '__main__':
             res, state = ssm.forward_rnn(x[0,i], state)
         print(res, state[..., :10], state.shape)
         
-
