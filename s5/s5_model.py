@@ -130,6 +130,7 @@ class S5SSM(torch.nn.Module):
                  V: torch.Tensor, Vinv: torch.Tensor, h: int, p: int,
                  dt_min: float,
                  dt_max: float,
+                 output_dim: Optional[int] = None,
                  liquid: bool = False,
                  factor_rank: Optional[int] = None,
                  discretization: Literal['zoh', 'bilinear'] = 'zoh',
@@ -168,6 +169,7 @@ class S5SSM(torch.nn.Module):
         self.liquid = liquid
         self.bcInit = bcInit
         self.bidir = bidir
+        output_dim = output_dim or h
         # TODO:
         # if self.clip_eigs:
         #    self.Lambda = np.clip(self.Lambda_re, None, -1e-4) + 1j * self.Lambda_im
@@ -179,7 +181,7 @@ class S5SSM(torch.nn.Module):
 
         match bcInit:
             case 'complex_normal':
-                self.C = torch.nn.Parameter(torch.normal(0, 0.5 ** 0.5, (h, cp), dtype=torch.complex64))
+                self.C = torch.nn.Parameter(torch.normal(0, 0.5 ** 0.5, (output_dim, cp), dtype=torch.complex64))
                 self.B = torch.nn.Parameter(init_VinvB(lecun_normal(), Vinv)((p, h), torch.float))
             case 'dense_columns' | 'dense':
                 if bcInit == "dense_columns":
@@ -192,16 +194,16 @@ class S5SSM(torch.nn.Module):
                 # TODO: make init_*VinvB all a the same interface
                 self.B = torch.nn.Parameter(B_eigen_init(B_init, Vinv)((p, h), torch.float))
                 if self.bidir:
-                    C = torch.cat([init_CV(C_init, (h, p), V), init_CV(C_init, (h, p), V)], axis=-1)
+                    C = torch.cat([init_CV(C_init, (output_dim, p), V), init_CV(C_init, (output_dim, p), V)], axis=-1)
                 else:
-                    C = init_CV(C_init, (h, p), V)
+                    C = init_CV(C_init, (output_dim, p), V)
                 self.C = torch.nn.Parameter(C)
             case 'factorized':
                 print('[WARN]: factorized was removed from the original repo, might be for a reason :?')
                 # Use a low rank factorization of rank k for B and C
                 self.BH = torch.nn.Parameter(as_complex(init_columnwise_B((h, k, 2), torch.float32)))
                 self.BP = torch.nn.Parameter(as_complex(init_columnwise_B((p, k, 2), torch.float32)))
-                self.CH = torch.nn.Parameter(as_complex(init_rowwise_C((k, h, 2), torch.float32)))
+                self.CH = torch.nn.Parameter(as_complex(init_rowwise_C((k, output_dim, 2), torch.float32)))
                 self.CP = torch.nn.Parameter(as_complex(init_rowwise_C((k, cp, 2), torch.float32)))
                 #self.BH = torch.nn.Parameter(init_columnwise_B((h, k), torch.complex64))
                 #self.BP = torch.nn.Parameter(init_columnwise_B((p, k), torch.complex64))
@@ -211,7 +213,7 @@ class S5SSM(torch.nn.Module):
                 raise NotImplementedError(f"BC_init method {bcInit} not implemented")
 
         # Initialize feedthrough (D) matrix
-        self.D = torch.nn.Parameter(torch.rand(h,))
+        self.D = torch.nn.Parameter(torch.rand(output_dim,))
         self.log_step = torch.nn.Parameter(init_log_steps(p, dt_min, dt_max))
         match discretization:
             case 'zoh':
@@ -359,14 +361,18 @@ class SingleLEDSSM(torch.nn.Module):
     def __init__(
         self,
         state_width: int,
+        output_dim: int = 1,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
         discretization: Literal['zoh', 'bilinear'] = 'zoh',
     ):
         super().__init__()
         state_width = int(state_width)
+        output_dim = int(output_dim)
         if state_width < 1:
             raise ValueError("state_width must be bigger than 1")
+        if output_dim < 1:
+            raise ValueError("output_dim must be positive")
 
         Lambda, _, B, V, _ = make_DPLR_HiPPO(state_width)
         Vinv = V.conj().T
@@ -383,6 +389,7 @@ class SingleLEDSSM(torch.nn.Module):
             p=state_width,
             dt_min=dt_min,
             dt_max=dt_max,
+            output_dim=output_dim,
             discretization=discretization,
             bcInit='dense',
         )
@@ -458,21 +465,19 @@ class SingleLEDSSM(torch.nn.Module):
         for u in input_sequence.transpose(0, 1):
             complex_u = u.to(B_bar.dtype).squeeze(-1)
             previous_state = state.to(Lambda_bar.dtype)
+            state_effect = Lambda_bar * previous_state
+            input_effect = B_bar.squeeze(-1) * complex_u.unsqueeze(-1)
             outputs.append(
                 (
-                    (C_tilde.squeeze(0) * Lambda_bar * previous_state).sum(dim=-1)
-                    + (
-                        C_tilde.squeeze(0)
-                        * (B_bar.squeeze(-1) * complex_u.unsqueeze(-1))
-                    ).sum(dim=-1)
+                    (C_tilde.unsqueeze(0) * state_effect.unsqueeze(1)).sum(dim=-1)
+                    + (C_tilde.unsqueeze(0) * input_effect.unsqueeze(1)).sum(dim=-1)
                 ).real
             )
-            state = (
-                Lambda_bar * previous_state
-                + B_bar.squeeze(-1) * complex_u.unsqueeze(-1)
-            )
+            state = state_effect + input_effect
 
         output = torch.stack(outputs, dim=1)
+        if output.shape[-1] == 1:
+            output = output.squeeze(-1)
         if return_state:
             return output, state
         return output
