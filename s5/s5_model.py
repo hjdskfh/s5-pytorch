@@ -366,7 +366,7 @@ class SingleLEDSSM(torch.nn.Module):
         super().__init__()
         state_width = int(state_width)
         if state_width < 1:
-            raise ValueError("state_width must be positive")
+            raise ValueError("state_width must be bigger than 1")
 
         Lambda, _, B, V, _ = make_DPLR_HiPPO(state_width)
         Vinv = V.conj().T
@@ -389,6 +389,31 @@ class SingleLEDSSM(torch.nn.Module):
 
     def initial_state(self, batch_size: Optional[int] = None):
         return self.ssm.initial_state(batch_size)
+
+    @torch.no_grad()
+    def export_parameters(
+        self,
+        step_scale: float | torch.Tensor = 1.0,
+    ) -> dict[str, torch.Tensor]:
+        """Return the trained scalar SSM in its diagonal state basis."""
+        if torch.is_tensor(step_scale) and step_scale.ndim != 0:
+            raise ValueError("step_scale must be a scalar for parameter export")
+
+        B_tilde, C_tilde = self.ssm.get_BC_tilde()
+        delta = step_scale * torch.exp(self.ssm.log_step)
+        lambda_bar, B_bar = self.ssm.discretize(
+            self.ssm.Lambda,
+            B_tilde,
+            delta,
+        )
+        A_bar = torch.diag(lambda_bar)
+
+        return {
+            "A": A_bar.detach().clone(),
+            "B": B_bar.detach().clone(),
+            "C": C_tilde.detach().clone(),
+            "delta": delta.detach().clone(),
+        }
 
     def forward(
         self,
