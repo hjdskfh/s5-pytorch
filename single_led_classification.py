@@ -1,14 +1,17 @@
+import copy
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, random_split
 
 from s5 import SingleLEDSSM
 
 
-SEQUENCE_LENGTH = 128
+SEQUENCE_LENGTH = 128 # nr of timesteps in the LED intensity sequence. Each step is one scalar value.
+STATE_WIDTH = 32 # hidden state width of the SSM
+OUTPUT_DIM = 32 # output dimension of the SSM, which is fed into the classifier
 CLASS_NAMES = ("seesaw", "sinus", "block")
 
 
@@ -43,19 +46,19 @@ def make_dataset(
 
 
 class LEDWaveformClassifier(nn.Module):
-    def __init__(self, sequence_length: int = SEQUENCE_LENGTH):
+    def __init__(self, state_width: int = STATE_WIDTH, output_dim: int = OUTPUT_DIM):
         super().__init__()
-        self.led_ssm = SingleLEDSSM(state_width=32)
+        self.led_ssm = SingleLEDSSM(state_width=state_width, output_dim=output_dim) #state_width = hidden state width of 32 for the SSM
         self.classifier = nn.Sequential(
-            nn.Linear(sequence_length, 64),
-            nn.GELU(),
-            nn.Linear(64, len(CLASS_NAMES)),
+            nn.Linear(output_dim, 64), # takes the input vector and transforms it into 64 features
+            nn.GELU(), # applies non lin activation function
+            nn.Linear(64, len(CLASS_NAMES)), # hidden layer with 64 features to output layer with number of classes
         )
 
     def forward(self, led_intensity: torch.Tensor) -> torch.Tensor:
         # led_intensity has shape [batch, sequence]: one scalar LED value per step.
         ssm_output = self.led_ssm(led_intensity)
-        return self.classifier(ssm_output)
+        return self.classifier(ssm_output[:, -1, :]) # [B, output_dim] - take the last output of the SSM for classification
 
 
 def evaluate(
@@ -130,21 +133,33 @@ def main() -> None:
     torch.manual_seed(7)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_signals, train_labels = make_dataset(600)
-    test_signals, test_labels = make_dataset(300)
+    all_signals, all_labels = make_dataset(900)
+    full_dataset = TensorDataset(all_signals, all_labels)
+    train_dataset, validation_dataset, test_dataset = random_split(
+        full_dataset,
+        [600, 150, 150],
+        generator=torch.Generator().manual_seed(7),
+    )
+
     train_loader = DataLoader(
-        TensorDataset(train_signals, train_labels),
+        train_dataset,
         batch_size=32,
         shuffle=True,
     )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=64,
+    )
     test_loader = DataLoader(
-        TensorDataset(test_signals, test_labels),
+        test_dataset,
         batch_size=64,
     )
 
     model = LEDWaveformClassifier().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     loss_function = nn.CrossEntropyLoss()
+    best_validation_accuracy = -1.0
+    best_model_state = None
 
     for epoch in range(60):
         model.train()
@@ -155,18 +170,35 @@ def main() -> None:
             loss.backward()
             optimizer.step()
 
+        validation_loss, validation_accuracy = evaluate(
+            model,
+            validation_loader,
+            device,
+        )
+        if validation_accuracy > best_validation_accuracy:
+            best_validation_accuracy = validation_accuracy
+            best_model_state = copy.deepcopy(model.state_dict())
+
         if (epoch + 1) % 10 == 0:
-            test_loss, test_accuracy = evaluate(model, test_loader, device)
             print(
                 f"epoch {epoch + 1}: "
-                f"test loss = {test_loss:.4f}, "
-                f"test accuracy = {test_accuracy:.2%}"
+                f"validation loss = {validation_loss:.4f}, "
+                f"validation accuracy = {validation_accuracy:.2%}"
             )
 
-    _, test_accuracy = evaluate(model, test_loader, device)
+    if best_model_state is None:
+        raise RuntimeError("Training did not produce a validation checkpoint")
+    model.load_state_dict(best_model_state)
+
+    test_loss, test_accuracy = evaluate(model, test_loader, device)
     print(f"device: {device}")
-    print(f"final test accuracy: {test_accuracy:.2%}")
+    print(f"best validation accuracy: {best_validation_accuracy:.2%}")
+    print(f"test loss: {test_loss:.4f}")
+    print(f"test accuracy: {test_accuracy:.2%}")
     export_parameters(model)
+    test_indices = test_dataset.indices
+    test_signals = all_signals[test_indices]
+    test_labels = all_labels[test_indices]
     plot_examples(model, test_signals[:3], test_labels[:3], device)
 
 

@@ -125,7 +125,7 @@ def as_complex(t: torch.Tensor, dtype=torch.complex64):
 Initialization = Literal['dense_columns', 'dense', 'factorized']
 
 
-class S5SSM(torch.nn.Module):
+class S5SSM(torch.nn.Module):   
     def __init__(self, lambdaInit: torch.Tensor,
                  V: torch.Tensor, Vinv: torch.Tensor, h: int, p: int,
                  dt_min: float,
@@ -361,7 +361,7 @@ class SingleLEDSSM(torch.nn.Module):
     def __init__(
         self,
         state_width: int,
-        output_dim: int = 1,
+        output_dim: int = 32,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
         discretization: Literal['zoh', 'bilinear'] = 'zoh',
