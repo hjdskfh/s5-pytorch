@@ -351,7 +351,7 @@ class SingleLEDSSM(torch.nn.Module):
 
     For each input ``u_k`` the LED output is computed from the previous state:
 
-        y_k = (C A_bar) x_{k-1} + (C B_bar) u_k
+        y_k = (C A_bar) x_{k-1} + (C B_bar) u_k + D u_k
 
     The state is then advanced for the next input:
 
@@ -419,6 +419,7 @@ class SingleLEDSSM(torch.nn.Module):
             "A": A_bar.detach().clone(),
             "B": B_bar.detach().clone(),
             "C": C_tilde.detach().clone(),
+            "D": self.ssm.D.detach().clone(),
             "delta": delta.detach().clone(),
         }
 
@@ -471,7 +472,7 @@ class SingleLEDSSM(torch.nn.Module):
                 (
                     (C_tilde.unsqueeze(0) * state_effect.unsqueeze(1)).sum(dim=-1)
                     + (C_tilde.unsqueeze(0) * input_effect.unsqueeze(1)).sum(dim=-1)
-                ).real
+                ).real + self.ssm.D.unsqueeze(0) * u
             )
             state = state_effect + input_effect
 
